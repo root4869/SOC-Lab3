@@ -1,20 +1,16 @@
-`include "bram11.v"
 module fir 
 #(  
     parameter pADDR_WIDTH = 12,
     parameter pDATA_WIDTH = 32,
     parameter Tape_Num    = 11
-)
-(
-    // AXI4-Lite Write Address Channel
+)(
+    // AXI4-Lite接口
     output wire                     awready,
     output wire                     wready,
     input  wire                     awvalid,
     input  wire [pADDR_WIDTH-1:0]   awaddr,
     input  wire                     wvalid,
     input  wire [pDATA_WIDTH-1:0]   wdata,
-    
-    // AXI4-Lite Read Address Channel
     output wire                     arready,
     input  wire                     rready,
     input  wire                     arvalid,
@@ -22,167 +18,191 @@ module fir
     output wire                     rvalid,
     output wire [pDATA_WIDTH-1:0]   rdata,    
     
-    // AXI-Stream Input
+    // 流数据接口
     input  wire                     ss_tvalid, 
     input  wire [pDATA_WIDTH-1:0]   ss_tdata, 
     input  wire                     ss_tlast, 
     output wire                     ss_tready, 
-    
-    // AXI-Stream Output
     input  wire                     sm_tready, 
     output wire                     sm_tvalid, 
     output wire [pDATA_WIDTH-1:0]   sm_tdata, 
     output wire                     sm_tlast, 
     
-    // Tap BRAM Interface
+    // BRAM接口
     output wire [3:0]               tap_WE,
     output wire                     tap_EN,
     output wire [pDATA_WIDTH-1:0]   tap_Di,
     output wire [pADDR_WIDTH-1:0]   tap_A,
-    inout  wire [pDATA_WIDTH-1:0]   tap_Do,
+    input  wire [pDATA_WIDTH-1:0]   tap_Do,
 
-    // Data BRAM Interface
     output wire [3:0]               data_WE,
     output wire                     data_EN,
     output wire [pDATA_WIDTH-1:0]   data_Di,
     output wire [pADDR_WIDTH-1:0]   data_A,
-    inout  wire [pDATA_WIDTH-1:0]   data_Do,
+    input  wire [pDATA_WIDTH-1:0]   data_Do,
 
     input  wire                     axis_clk,
     input  wire                     axis_rst_n
 );
 
-    // AXI4-Lite Control Logic
-    reg axi_awready;
-    reg axi_wready;
-    reg axi_arready;
-    reg [pDATA_WIDTH-1:0] axi_rdata_reg;
-    reg axi_rvalid;
+    // 状态定义
+    localparam [1:0] IDLE  = 2'b00;
+    localparam [1:0] START = 2'b01;
+    localparam [1:0] DONE  = 2'b10;
 
-    // Internal Registers
-    reg [pADDR_WIDTH-1:0] write_ptr = 0;
-    reg [pADDR_WIDTH-1:0] read_ptr = 0;
-    reg [pDATA_WIDTH-1:0] acc = 0;
-    reg [4:0] tap_cnt = 0;
-    reg calc_done = 0;
-    reg [2:0] state = 0;
+    // 内部信号
+    reg [1:0] current_state, next_state;
+    reg [pADDR_WIDTH-1:0] tap_addr;
+    reg [pDATA_WIDTH-1:0] length_reg;
+    reg [2:0] ap_ctrl; // {ap_start, ap_done, ap_idle}
+    
+    // FIR计算相关
+    reg signed [pDATA_WIDTH-1:0] mult_result;
+    reg signed [pDATA_WIDTH-1:0] fir_accum;
+    reg [pDATA_WIDTH-1:0] input_reg;
+    reg [pADDR_WIDTH-1:0] wr_ptr, rd_ptr;
+    reg [6:0] cycle_counter;
+    reg [9:0] data_counter;
 
-    // AXI-Stream Control
-    assign ss_tready = (write_ptr < (2**pADDR_WIDTH - 1));
-    assign sm_tvalid = calc_done;
-    assign sm_tlast = calc_done;
-    assign sm_tdata = acc;
+    // AXI-Lite控制信号
+    wire axi_aw_ready = (current_state == IDLE) && awvalid && wvalid;
+    wire axi_ar_ready = arvalid && !rvalid;
 
-    // AXI4-Lite Write Channel
-    assign awready = axi_awready;
-    assign wready = axi_wready;
+    // 状态转换逻辑
+    always @(posedge axis_clk or negedge axis_rst_n) begin
+        if (!axis_rst_n)
+            current_state <= IDLE;
+        else
+            current_state <= next_state;
+    end
 
-    always @(posedge axis_clk) begin
+    always @(*) begin
+        next_state = current_state;
+        case(current_state)
+            IDLE:   if (ap_ctrl[0]) next_state = START;
+            START:  if (data_counter == length_reg-1 && sm_tready) next_state = DONE;
+            DONE:   next_state = IDLE;
+        endcase
+    end
+
+    // AXI-Lite写通道
+    always @(posedge axis_clk or negedge axis_rst_n) begin
         if (!axis_rst_n) begin
-            axi_awready <= 0;
-            axi_wready <= 0;
+            ap_ctrl <= 3'b100; // 初始化为idle状态
+            length_reg <= 0;
         end else begin
-            axi_awready <= awvalid && !axi_awready;
-            axi_wready <= wvalid && !axi_wready;
+            if (axi_aw_ready) begin
+                case(awaddr)
+                    12'h00: ap_ctrl[0] <= wdata[0]; // ap_start
+                    12'h10: length_reg <= wdata;
+                endcase
+            end
+            // 状态更新
+            ap_ctrl[1] <= (current_state == DONE); // ap_done
+            ap_ctrl[2] <= (current_state == IDLE); // ap_idle
         end
     end
 
-    // AXI4-Lite Read Channel
-    assign arready = axi_arready;
-    assign rvalid = axi_rvalid;
-    assign rdata = axi_rdata_reg;
-
-    always @(posedge axis_clk) begin
+    // AXI-Lite读通道
+    reg [pDATA_WIDTH-1:0] read_data;
+    always @(posedge axis_clk or negedge axis_rst_n) begin
         if (!axis_rst_n) begin
-            axi_arready <= 0;
-            axi_rvalid <= 0;
-        end else if (arvalid && !axi_arready) begin
-            axi_arready <= 1;
-            axi_rvalid <= 1;
-            if (araddr < Tape_Num)
-                axi_rdata_reg <= tap_Do;  // Read from coefficient BRAM
-            else
-                axi_rdata_reg <= 0;
-        end else begin
-            axi_arready <= 0;
-            if (rready) axi_rvalid <= 0;
+            read_data <= 0;
+        end else if (arvalid && axi_ar_ready) begin
+            case(araddr)
+                12'h00: read_data <= {29'd0, ap_ctrl};
+                12'h10: read_data <= length_reg;
+                default: read_data <= tap_Do;
+            endcase
         end
     end
 
-    // Data BRAM Write Control
-    assign data_WE = (ss_tvalid && ss_tready) ? 4'b1111 : 4'b0000;
-    assign data_EN = 1'b1;
-    assign data_Di = ss_tdata;
-    assign data_A = (state == 1 && tap_cnt < Tape_Num) ? (read_ptr - tap_cnt) : 0;
-
-    // Tap BRAM Write Control
-    assign tap_WE = (awvalid && awready) ? 4'b1111 : 4'b0000;
-    assign tap_EN = 1'b1;
+    // BRAM控制逻辑
+    assign tap_WE = (awaddr >= 12'h20 && axi_aw_ready) ? 4'b1111 : 4'b0;
     assign tap_Di = wdata;
-    assign tap_A = (state == 1 && tap_cnt < Tape_Num) ? tap_cnt : 0;
+    assign tap_EN = 1'b1;
+    assign data_WE = (current_state == START && cycle_counter == Tape_Num) ? 4'b1111 : 4'b0;
+    assign data_Di = input_reg;
+    assign data_EN = 1'b1;
 
-    // Data Write Process
+    // 数据通路
     always @(posedge axis_clk) begin
-        if (!axis_rst_n) begin
-            write_ptr <= 0;
-        end else if (ss_tvalid && ss_tready) begin
-            write_ptr <= write_ptr + 1;
+        if (ss_tvalid && ss_tready)
+            input_reg <= ss_tdata;
+    end
+
+    // FIR计算逻辑
+    always @(posedge axis_clk) begin
+        if (current_state == START) begin
+            if (cycle_counter < Tape_Num) begin
+                mult_result <= input_reg * tap_Do;
+                fir_accum <= fir_accum + mult_result;
+            end else begin
+                fir_accum <= 0;
+            end
         end
     end
 
-    // FIR Calculation FSM
-    always @(posedge axis_clk) begin
+    // 地址生成逻辑
+    always @(posedge axis_clk or negedge axis_rst_n) begin
         if (!axis_rst_n) begin
-            state <= 0;
-            acc <= 0;
-            tap_cnt <= 0;
-            calc_done <= 0;
+            wr_ptr <= 0;
+            rd_ptr <= 0;
         end else begin
-            case(state)
-                0: begin  // Idle
-                    if (sm_tready) begin
-                        read_ptr <= write_ptr - Tape_Num;
-                        state <= 1;
-                    end
+            case(current_state)
+                IDLE: begin
+                    wr_ptr <= 0;
+                    rd_ptr <= 0;
                 end
-                1: begin  // Multiply-Accumulate
-                    if (tap_cnt < Tape_Num) begin
-                        acc <= acc + (data_Do * tap_Do);
-                        tap_cnt <= tap_cnt + 1;
-                    end else begin
-                        calc_done <= 1;
-                        state <= 2;
-                    end
-                end
-                2: begin  // Wait for output ready
-                    if (sm_tready) begin
-                        calc_done <= 0;
-                        acc <= 0;
-                        tap_cnt <= 0;
-                        state <= 0;
+                START: begin
+                    if (cycle_counter == 0) begin
+                        wr_ptr <= wr_ptr + 1;
+                        rd_ptr <= rd_ptr + 1;
                     end
                 end
             endcase
         end
     end
 
-    // Instantiation of BRAM modules
-    bram11 tap_bram (
-        .CLK(axis_clk),
-        .WE(tap_WE),
-        .EN(tap_EN),
-        .Di(tap_Di),
-        .Do(tap_Do),
-        .A(tap_A)
-    );
+    // 计数器逻辑
+    always @(posedge axis_clk or negedge axis_rst_n) begin
+        if (!axis_rst_n) begin
+            cycle_counter <= 0;
+            data_counter <= 0;
+        end else begin
+            if (current_state == START) begin
+                if (cycle_counter < Tape_Num)
+                    cycle_counter <= cycle_counter + 1;
+                else
+                    cycle_counter <= 0;
 
-    bram11 data_bram (
-        .CLK(axis_clk),
-        .WE(data_WE),
-        .EN(data_EN),
-        .Di(data_Di),
-        .Do(data_Do),
-        .A(data_A)
-    );
+                if (sm_tvalid && sm_tready)
+                    data_counter <= data_counter + 1;
+            end else begin
+                cycle_counter <= 0;
+                data_counter <= 0;
+            end
+        end
+    end
+
+    // 输出逻辑
+    assign sm_tvalid = (cycle_counter == Tape_Num);
+    assign sm_tdata = fir_accum;
+    assign sm_tlast = (data_counter == length_reg-1);
+    assign ss_tready = (current_state == START && cycle_counter == 0);
+
+    // BRAM地址分配
+    assign tap_A = (current_state == IDLE) ? (awaddr - 12'h20) :
+                   (current_state == START) ? cycle_counter :
+                   (araddr - 12'h20);
+    assign data_A = (current_state == IDLE) ? {rd_ptr, 2'b00} :
+                    (current_state == START) ? {wr_ptr, 2'b00} : 0;
+
+    // AXI-Lite响应信号
+    assign awready = axi_aw_ready;
+    assign wready = axi_aw_ready;
+    assign arready = axi_ar_ready;
+    assign rvalid = (read_data != 0);
+    assign rdata = read_data;
 
 endmodule
